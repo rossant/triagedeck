@@ -10,11 +10,30 @@ from django.http import Http404, JsonResponse
 from django.utils import timezone
 from django.views.decorators.http import require_http_methods
 
-from django_app.models import DecisionEvent, DecisionLatest, Item, ItemVariant, Project
+from django_app.models import (
+    DecisionEvent,
+    DecisionLatest,
+    ExportJob,
+    Item,
+    ItemVariant,
+    Project,
+    Role,
+)
 from django_app.permissions import can_write_events, project_role_or_404, require_auth
 
 CURSOR_TTL_MS = 7 * 24 * 60 * 60 * 1000
 SKEW_WINDOW_MS = 24 * 60 * 60 * 1000
+EXPORT_TTL_MS = 7 * 24 * 60 * 60 * 1000
+DEFAULT_EXPORT_ALLOWLIST = {
+    "item_id",
+    "external_id",
+    "decision_id",
+    "note",
+    "ts_server",
+    "variant_key",
+    "metadata.subject_id",
+    "metadata.session_id",
+}
 
 
 def now_ms() -> int:
@@ -217,6 +236,13 @@ def _event_rank(ts_client_effective: int, ts_server: int, event_id: str):
     return (ts_client_effective, ts_server, event_id)
 
 
+def _parse_json_body(request):
+    try:
+        return json.loads(request.body.decode("utf-8"))
+    except Exception:
+        return None
+
+
 @require_http_methods(["POST"])
 def events_post(request, project_id):
     try:
@@ -230,9 +256,8 @@ def events_post(request, project_id):
     if not can_write_events(role):
         return api_error(403, "forbidden", "You do not have permission for this action")
 
-    try:
-        body = json.loads(request.body.decode("utf-8"))
-    except Exception:
+    body = _parse_json_body(request)
+    if body is None:
         return api_error(400, "bad_request", "Invalid JSON body")
 
     events = body.get("events") or []
@@ -364,6 +389,194 @@ def events_post(request, project_id):
             "results": results,
         }
     )
+
+
+def _export_visible_queryset(project_id, user_id: int, role: str):
+    qs = ExportJob.objects.filter(project_id=project_id)
+    if role != Role.ADMIN:
+        qs = qs.filter(requested_by_user_id=user_id)
+    return qs
+
+
+@require_http_methods(["POST"])
+def exports_create(request, project_id):
+    try:
+        ctx = require_auth(request)
+        role = project_role_or_404(project_id, ctx.user_id)
+    except PermissionError:
+        return api_error(401, "unauthorized", "Authentication required")
+    except Http404:
+        return api_error(404, "not_found", "Resource not found")
+
+    if role not in {Role.ADMIN, Role.REVIEWER}:
+        return api_error(403, "forbidden", "You do not have permission for this action")
+
+    body = _parse_json_body(request)
+    if body is None:
+        return api_error(400, "bad_request", "Invalid JSON body")
+
+    project = Project.objects.filter(id=project_id, deleted_at__isnull=True).first()
+    if not project:
+        return api_error(404, "not_found", "Resource not found")
+
+    include_fields = body.get("include_fields") or []
+    allowlist = set((project.config_json or {}).get("export_allowlist", []))
+    if not allowlist:
+        allowlist = DEFAULT_EXPORT_ALLOWLIST
+    for field in include_fields:
+        if field not in allowlist:
+            return api_error(422, "field_not_allowlisted", f"Field not allowlisted: {field}")
+
+    created_at = now_ms()
+    row_count = DecisionLatest.objects.filter(project_id=project_id).count()
+    manifest = {
+        "snapshot_at": created_at,
+        "project_id": str(project_id),
+        "decision_schema_version": (project.decision_schema_json or {}).get("version", 1),
+        "label_policy": body.get("label_policy", "latest_per_user"),
+        "filters": body.get("filters", {}),
+        "row_count": row_count,
+        "sha256": "",
+    }
+
+    job = ExportJob.objects.create(
+        project_id=project_id,
+        requested_by_user_id=ctx.user_id,
+        status=ExportJob.STATUS_READY,
+        mode=body.get("mode", ExportJob.MODE_LABELS_ONLY),
+        label_policy=body.get("label_policy", "latest_per_user"),
+        format=body.get("format", "jsonl"),
+        filters_json=body.get("filters", {}),
+        include_fields_json=include_fields,
+        manifest_json=manifest,
+        file_uri=f"/exports/{project_id}/{created_at}.jsonl",
+        expires_at=created_at + EXPORT_TTL_MS,
+        created_at=created_at,
+        completed_at=created_at,
+    )
+    return JsonResponse({"export_id": str(job.id), "status": "queued"})
+
+
+@require_http_methods(["GET"])
+def exports_list(request, project_id):
+    try:
+        ctx = require_auth(request)
+        role = project_role_or_404(project_id, ctx.user_id)
+    except PermissionError:
+        return api_error(401, "unauthorized", "Authentication required")
+    except Http404:
+        return api_error(404, "not_found", "Resource not found")
+
+    try:
+        limit = min(max(int(request.GET.get("limit", "50")), 1), 100)
+    except ValueError:
+        return api_error(400, "bad_request", "Invalid limit")
+
+    try:
+        cursor = decode_cursor(request.GET.get("cursor"))
+    except ValueError:
+        return api_error(400, "invalid_cursor", "Cursor is invalid or expired")
+
+    qs = _export_visible_queryset(project_id, ctx.user_id, role)
+    if cursor:
+        qs = qs.filter(
+            Q(created_at__lt=cursor["created_at"])
+            | Q(created_at=cursor["created_at"], id__lt=cursor["id"])
+        )
+    rows = list(qs.order_by("-created_at", "-id")[:limit])
+    next_cursor = None
+    if rows:
+        last = rows[-1]
+        next_cursor = encode_cursor({"created_at": last.created_at, "id": str(last.id)})
+
+    return JsonResponse(
+        {
+            "exports": [
+                {
+                    "export_id": str(r.id),
+                    "status": r.status,
+                    "format": r.format,
+                    "mode": r.mode,
+                    "created_at": r.created_at,
+                }
+                for r in rows
+            ],
+            "next_cursor": next_cursor,
+        }
+    )
+
+
+@require_http_methods(["GET"])
+def exports_get(request, project_id, export_id):
+    try:
+        ctx = require_auth(request)
+        role = project_role_or_404(project_id, ctx.user_id)
+    except PermissionError:
+        return api_error(401, "unauthorized", "Authentication required")
+    except Http404:
+        return api_error(404, "not_found", "Resource not found")
+
+    row = ExportJob.objects.filter(id=export_id, project_id=project_id).first()
+    if not row:
+        return api_error(404, "not_found", "Resource not found")
+    if role != Role.ADMIN and row.requested_by_user_id != ctx.user_id:
+        return api_error(403, "forbidden", "You do not have permission for this action")
+    if row.expires_at and row.expires_at < now_ms():
+        return api_error(410, "export_expired", "Export has expired")
+
+    return JsonResponse(
+        {
+            "export_id": str(row.id),
+            "status": row.status,
+            "format": row.format,
+            "mode": row.mode,
+            "manifest": row.manifest_json,
+            "download_url": row.file_uri,
+            "expires_at": row.expires_at,
+        }
+    )
+
+
+@require_http_methods(["DELETE"])
+def exports_cancel(request, project_id, export_id):
+    try:
+        ctx = require_auth(request)
+        role = project_role_or_404(project_id, ctx.user_id)
+    except PermissionError:
+        return api_error(401, "unauthorized", "Authentication required")
+    except Http404:
+        return api_error(404, "not_found", "Resource not found")
+
+    row = ExportJob.objects.filter(id=export_id, project_id=project_id).first()
+    if not row:
+        return api_error(404, "not_found", "Resource not found")
+    if role != Role.ADMIN and row.requested_by_user_id != ctx.user_id:
+        return api_error(403, "forbidden", "You do not have permission for this action")
+
+    if row.status == ExportJob.STATUS_READY:
+        return api_error(409, "export_ready", "Cannot cancel a ready export")
+    if row.status in {ExportJob.STATUS_FAILED, ExportJob.STATUS_EXPIRED}:
+        return JsonResponse({"status": row.status})
+
+    row.status = ExportJob.STATUS_FAILED
+    row.error_code = "export_cancelled"
+    row.completed_at = now_ms()
+    row.save(update_fields=["status", "error_code", "completed_at"])
+    return JsonResponse({"status": "failed", "error": {"code": "export_cancelled"}})
+
+
+@require_http_methods(["GET", "POST"])
+def exports_collection(request, project_id):
+    if request.method == "GET":
+        return exports_list(request, project_id)
+    return exports_create(request, project_id)
+
+
+@require_http_methods(["GET", "DELETE"])
+def exports_detail(request, project_id, export_id):
+    if request.method == "GET":
+        return exports_get(request, project_id, export_id)
+    return exports_cancel(request, project_id, export_id)
 
 
 @require_http_methods(["GET"])

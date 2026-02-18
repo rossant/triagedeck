@@ -22,4 +22,14 @@ urlpatterns = [
         views.decisions_list,
         name="decisions_list",
     ),
+    path(
+        "api/v1/projects/<uuid:project_id>/exports",
+        views.exports_collection,
+        name="exports_collection",
+    ),
+    path(
+        "api/v1/projects/<uuid:project_id>/exports/<uuid:export_id>",
+        views.exports_detail,
+        name="exports_detail",
+    ),
 ]
