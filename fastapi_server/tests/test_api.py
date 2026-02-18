@@ -9,6 +9,7 @@ from sqlalchemy import select
 from fastapi_server.auth import User
 from fastapi_server.db import init_db, item, project, session_scope
 from fastapi_server.main import (
+    cancel_export,
     create_export,
     get_export,
     ingest_events,
@@ -60,6 +61,15 @@ def test_items_cursor_flow():
     page2 = list_items(project_id=pid, cursor=page1["next_cursor"], limit=5, user=user)
     assert len(page2["items"]) >= 1
     assert page2["items"][0]["item_id"] != page1["items"][0]["item_id"]
+
+
+def test_items_invalid_cursor():
+    pid = _project_id()
+    user = User(user_id="reviewer@example.com", email="reviewer@example.com")
+    with pytest.raises(HTTPException) as exc:
+        list_items(project_id=pid, cursor="not-a-real-cursor", limit=5, user=user)
+    assert exc.value.status_code == 400
+    assert exc.value.detail["error"]["code"] == "invalid_cursor"
 
 
 def test_event_idempotency_and_resume():
@@ -134,3 +144,41 @@ def test_export_create_and_get():
     export_id = created["export_id"]
     fetched = get_export(project_id=pid, export_id=export_id, user=user)
     assert fetched["status"] == "ready"
+
+
+def test_export_rejects_non_allowlisted_field():
+    pid = _project_id()
+    user = User(user_id="reviewer@example.com", email="reviewer@example.com")
+    with pytest.raises(HTTPException) as exc:
+        create_export(
+            project_id=pid,
+            body=ExportCreateRequest(
+                mode="labels_only",
+                label_policy="latest_per_user",
+                format="jsonl",
+                filters={},
+                include_fields=["metadata.secret_field"],
+            ),
+            user=user,
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail["error"]["code"] == "field_not_allowlisted"
+
+
+def test_cancel_ready_export_conflicts():
+    pid = _project_id()
+    user = User(user_id="reviewer@example.com", email="reviewer@example.com")
+    created = create_export(
+        project_id=pid,
+        body=ExportCreateRequest(
+            mode="labels_only",
+            label_policy="latest_per_user",
+            format="jsonl",
+            filters={},
+            include_fields=["item_id", "external_id", "decision_id", "note", "ts_server"],
+        ),
+        user=user,
+    )
+    with pytest.raises(HTTPException) as exc:
+        cancel_export(project_id=pid, export_id=created["export_id"], user=user)
+    assert exc.value.status_code == 409

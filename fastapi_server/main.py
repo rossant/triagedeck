@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import and_, func, or_, select
 
 from fastapi_server.auth import User, get_user, project_role_or_404
@@ -37,6 +38,13 @@ from fastapi_server.storage import StorageResolver
 
 app = FastAPI(title="triagedeck")
 resolver = StorageResolver()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://127.0.0.1:8080", "http://localhost:8080"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")

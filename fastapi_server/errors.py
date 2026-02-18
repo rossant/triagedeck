@@ -29,7 +29,7 @@ def bad_request(code: str, message: str, details: dict | None = None) -> HTTPExc
 
 
 def validation_error(code: str, message: str, details: dict | None = None) -> HTTPException:
-    return error(status.HTTP_422_UNPROCESSABLE_ENTITY, code, message, details)
+    return error(status.HTTP_422_UNPROCESSABLE_CONTENT, code, message, details)
 
 
 def conflict(code: str, message: str, details: dict | None = None) -> HTTPException:

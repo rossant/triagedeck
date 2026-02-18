@@ -14,11 +14,19 @@ Auth for local testing: set request header `x-user-id` to one of:
 - `reviewer@example.com`
 - `viewer@example.com`
 
+Client keyboard shortcuts:
+
+- `Left`/`Right`: previous/next item
+- `P`: PASS decision
+- `F`: FAIL decision
+- `R`: force sync
+
 ## Developer Commands (`just`)
 
 - `just bootstrap`
 - `just dev`
 - `just test`
+- `just test-api` (core API tests + live HTTP contract tests with explicit skip reasons)
 - `just lint`
 - `just fmt`
 - `just check`

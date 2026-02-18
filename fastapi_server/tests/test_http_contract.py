@@ -8,7 +8,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 import pytest
@@ -38,8 +38,13 @@ def _request(
         data = json.dumps(body).encode("utf-8")
         req_headers["Content-Type"] = "application/json"
     req = Request(url=url, method=method, headers=req_headers, data=data)
-    with urlopen(req, timeout=10) as resp:
-        return resp.status, json.loads(resp.read().decode("utf-8"))
+    try:
+        with urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        raw = exc.read().decode("utf-8")
+        payload = json.loads(raw) if raw else {}
+        return exc.code, payload
 
 
 def _wait_ready(base_url: str, timeout_s: float = 15.0) -> None:
@@ -151,6 +156,18 @@ def test_http_items_cursor_and_single_item(live_server: str):
     assert single["item_id"] == item_id
 
 
+def test_http_invalid_cursor(live_server: str):
+    project_id = _project_id()
+    headers = {"x-user-id": "reviewer@example.com"}
+    status, body = _request(
+        "GET",
+        f"{live_server}/api/v1/projects/{project_id}/items?limit=5&cursor=bad-cursor",
+        headers=headers,
+    )
+    assert status == 400
+    assert body["error"]["code"] == "invalid_cursor"
+
+
 def test_http_event_ingest_idempotency_and_resume(live_server: str):
     project_id = _project_id()
     item_id = _first_item_id()
@@ -233,3 +250,43 @@ def test_http_export_create_list_get(live_server: str):
     assert status == 200
     assert fetched["status"] == "ready"
     assert fetched["manifest"]["row_count"] >= 0
+
+
+def test_http_export_allowlist_and_cancel_ready(live_server: str):
+    project_id = _project_id()
+    headers = {"x-user-id": "reviewer@example.com"}
+
+    status, body = _request(
+        "POST",
+        f"{live_server}/api/v1/projects/{project_id}/exports",
+        headers=headers,
+        body={
+            "mode": "labels_only",
+            "label_policy": "latest_per_user",
+            "format": "jsonl",
+            "filters": {},
+            "include_fields": ["metadata.secret_field"],
+        },
+    )
+    assert status == 422
+    assert body["error"]["code"] == "field_not_allowlisted"
+
+    _, created = _request(
+        "POST",
+        f"{live_server}/api/v1/projects/{project_id}/exports",
+        headers=headers,
+        body={
+            "mode": "labels_only",
+            "label_policy": "latest_per_user",
+            "format": "jsonl",
+            "filters": {},
+            "include_fields": ["item_id", "external_id", "decision_id", "note", "ts_server"],
+        },
+    )
+    status, body = _request(
+        "DELETE",
+        f"{live_server}/api/v1/projects/{project_id}/exports/{created['export_id']}",
+        headers=headers,
+    )
+    assert status == 409
+    assert body["error"]["code"] == "export_ready"
