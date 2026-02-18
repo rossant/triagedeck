@@ -21,6 +21,12 @@ Client keyboard shortcuts:
 - `F`: FAIL decision
 - `R`: force sync
 
+Client state tools:
+
+- `Export Local State`: downloads local browser state JSON
+- `Import Local State`: restores exported JSON (schema + project validated)
+- `Crash Replay Test`: simulates restart/replay and verifies pending queue flush
+
 ## Developer Commands (`just`)
 
 - `just bootstrap`

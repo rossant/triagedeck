@@ -43,6 +43,19 @@
       </div>
     </section>
 
+    <section class="maintenance">
+      <h2>State Tools</h2>
+      <div class="decision-row">
+        <button id="export-state">Export Local State</button>
+        <input id="import-file" type="file" accept="application/json" />
+        <button id="import-state">Import Local State</button>
+        <button id="crash-replay">Crash Replay Test</button>
+      </div>
+      <p class="help">
+        Export/import includes pending events, local decisions, sync state, last position, and URL state.
+      </p>
+    </section>
+
     <section>
       <h2>Decision Log</h2>
       <pre id="log"></pre>
