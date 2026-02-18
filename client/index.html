@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>triagedeck local</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="app-shell">
+    <header class="topbar">
+      <h1>triagedeck</h1>
+      <div class="auth-row">
+        <label for="user">User</label>
+        <input id="user" value="reviewer@example.com" />
+        <button id="reload">Load</button>
+      </div>
+    </header>
+
+    <section id="sync-banner" class="sync-banner sync-ok">
+      <strong id="sync-state">SYNC_OK</strong>
+      <span id="queue-depth">Queued: 0</span>
+      <span id="last-sync">Last sync: never</span>
+      <span id="sync-error"></span>
+    </section>
+
+    <section class="viewer">
+      <div class="item-header">
+        <button id="prev">Prev (Left)</button>
+        <button id="next">Next (Right)</button>
+        <div id="item-title">No item loaded</div>
+      </div>
+      <div class="item-body">
+        <img id="item-image" alt="Current item" />
+        <pre id="item-metadata"></pre>
+      </div>
+      <div class="decision-row">
+        <button id="pass">PASS (P)</button>
+        <button id="fail">FAIL (F)</button>
+        <label for="note">Note</label>
+        <input id="note" placeholder="Optional note" />
+        <button id="force-sync">Sync now (R)</button>
+      </div>
+    </section>
+
+    <section class="maintenance">
+      <h2>State Tools</h2>
+      <div class="decision-row">
+        <button id="export-state">Export Local State</button>
+        <input id="import-file" type="file" accept="application/json" />
+        <button id="import-state">Import Local State</button>
+        <button id="crash-replay">Crash Replay Test</button>
+      </div>
+      <p class="help">
+        Export/import includes pending events, local decisions, sync state, last position, and URL state.
+      </p>
+    </section>
+
+    <section>
+      <h2>Decision Log</h2>
+      <pre id="log"></pre>
+    </section>
+  </main>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

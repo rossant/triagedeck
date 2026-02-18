@@ -2,6 +2,26 @@
 
 Source of truth: `docs/spec.md` v1.3 and `docs/api.md`.
 
+## Immediate Next Steps (Implementation Order)
+
+1. Close API spec-parity gaps across FastAPI and Django adapter:
+   - strict cursor expiry behavior
+   - export limits/concurrency rules
+   - deterministic ordering edge cases
+   - consistent error code semantics
+2. Harden export pipeline from baseline to production-ready behavior:
+   - deterministic dataset artifact generation
+   - manifest hash/row reproducibility guarantees
+   - storage abstraction + expiry cleanup and audit hooks
+3. Expand client resilience coverage:
+   - offline queue accumulation/replay tests
+   - reconnect idempotency checks
+   - URL state round-trip recovery validation
+4. Add Phase 1 performance gate automation:
+   - p95 local decision latency
+   - p95 sync ack latency
+   - regression guardrails in CI/local checks
+
 ## 1. Backend Data Model
 
 - [ ] Create tables: `organization`, `organization_membership`, `project`, `item`, `item_variant`.
@@ -125,3 +145,21 @@ Source of truth: `docs/spec.md` v1.3 and `docs/api.md`.
 - [ ] No decision loss in crash-recovery test.
 - [ ] Local export/import round-trip without data loss.
 - [ ] External ML export reproducibility: deterministic row_count + sha256 for same snapshot/filter.
+
+## 13. Developer Operations (`just`)
+
+- [ ] Add a root `justfile` and make it the primary local workflow entrypoint.
+- [ ] `just bootstrap` installs dependencies and initializes local configuration.
+- [ ] `just dev` runs the local FastAPI server and client for end-to-end local testing.
+- [ ] `just test` runs full automated checks.
+- [ ] `just test-api` runs backend/API and contract tests.
+- [ ] `just test-client` runs client tests.
+- [ ] `just lint` runs static analysis checks.
+- [ ] `just fmt` formats code.
+- [ ] `just check` runs formatting, linting, and tests as a CI-equivalent local gate.
+- [ ] `just db-migrate` creates database migrations.
+- [ ] `just db-upgrade` applies migrations to the local database.
+- [ ] `just db-reset` recreates local database state for clean-room testing.
+- [ ] `just seed` loads deterministic local demo data.
+- [ ] `just clean` removes generated artifacts and caches.
+- [ ] `just export-smoke` performs a quick local export-job smoke test.
