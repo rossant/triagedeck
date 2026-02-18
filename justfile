@@ -32,7 +32,9 @@ test-api:
     UV_CACHE_DIR={{uv_cache_dir}} uv run python -m pytest -q -rs fastapi_server/tests/test_http_contract.py
 
 test-client:
-    @echo "No automated client tests yet"
+    @echo "[test-client] Browser workflow tests (Playwright)"
+    @echo "[test-client] If skipped, pytest will print the skip reason below."
+    UV_CACHE_DIR={{uv_cache_dir}} uv run python -m pytest -q -rs fastapi_server/tests/test_client_browser.py
 
 lint:
     UV_CACHE_DIR={{uv_cache_dir}} uv run python -m ruff check .

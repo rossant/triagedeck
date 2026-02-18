@@ -33,6 +33,7 @@ Client state tools:
 - `just dev`
 - `just test`
 - `just test-api` (core API tests + live HTTP contract tests with explicit skip reasons)
+- `just test-client` (browser workflow tests; skips with reason if Playwright/browser/socket unavailable)
 - `just lint`
 - `just fmt`
 - `just check`
@@ -40,3 +41,8 @@ Client state tools:
 - `just db-reset`
 - `just seed`
 - `just export-smoke`
+
+Playwright setup (for `just test-client`):
+
+- `uv add --dev playwright`
+- `uv run playwright install chromium`
