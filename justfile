@@ -25,7 +25,11 @@ test:
     UV_CACHE_DIR={{uv_cache_dir}} uv run python -m pytest -q
 
 test-api:
-    UV_CACHE_DIR={{uv_cache_dir}} uv run python -m pytest -q fastapi_server/tests
+    @echo "[test-api] Core API tests"
+    UV_CACHE_DIR={{uv_cache_dir}} uv run python -m pytest -q fastapi_server/tests/test_api.py
+    @echo "[test-api] Live HTTP contract tests (socket/network required)"
+    @echo "[test-api] If skipped, pytest will print the skip reason below."
+    UV_CACHE_DIR={{uv_cache_dir}} uv run python -m pytest -q -rs fastapi_server/tests/test_http_contract.py
 
 test-client:
     @echo "No automated client tests yet"
