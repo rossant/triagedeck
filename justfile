@@ -44,15 +44,15 @@ fmt:
 
 check: fmt lint test
 
-db-migrate:
-    @echo "Alembic not wired yet; schema is managed in fastapi_server/db.py"
+db-migrate name:
+    UV_CACHE_DIR={{uv_cache_dir}} uv run alembic -c alembic.ini revision --autogenerate -m "{{name}}"
 
 db-upgrade:
-    UV_CACHE_DIR={{uv_cache_dir}} uv run python -m fastapi_server.db init
+    UV_CACHE_DIR={{uv_cache_dir}} uv run alembic -c alembic.ini upgrade head
 
 db-reset:
     rm -f data/triagedeck.db
-    UV_CACHE_DIR={{uv_cache_dir}} uv run python -m fastapi_server.db init
+    UV_CACHE_DIR={{uv_cache_dir}} uv run alembic -c alembic.ini upgrade head
 
 seed:
     UV_CACHE_DIR={{uv_cache_dir}} uv run python -m scripts.seed

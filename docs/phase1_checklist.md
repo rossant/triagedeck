@@ -2,6 +2,26 @@
 
 Source of truth: `docs/spec.md` v1.3 and `docs/api.md`.
 
+## Immediate Next Steps (Implementation Order)
+
+1. Close API spec-parity gaps across FastAPI and Django adapter:
+   - strict cursor expiry behavior
+   - export limits/concurrency rules
+   - deterministic ordering edge cases
+   - consistent error code semantics
+2. Harden export pipeline from baseline to production-ready behavior:
+   - deterministic dataset artifact generation
+   - manifest hash/row reproducibility guarantees
+   - storage abstraction + expiry cleanup and audit hooks
+3. Expand client resilience coverage:
+   - offline queue accumulation/replay tests
+   - reconnect idempotency checks
+   - URL state round-trip recovery validation
+4. Add Phase 1 performance gate automation:
+   - p95 local decision latency
+   - p95 sync ack latency
+   - regression guardrails in CI/local checks
+
 ## 1. Backend Data Model
 
 - [ ] Create tables: `organization`, `organization_membership`, `project`, `item`, `item_variant`.

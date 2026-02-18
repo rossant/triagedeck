@@ -24,3 +24,15 @@
 ## Scope Status
 
 This implementation is a runnable baseline for Phase 1, not full feature-complete parity yet.
+
+## Next Steps
+
+1. API parity hardening:
+   - align remaining FastAPI + Django adapter behavior with `docs/spec.md`
+   - enforce export limit/concurrency and cursor-expiry edge cases uniformly
+2. Export pipeline hardening:
+   - move from baseline export behavior to reproducible artifact pipeline with stronger lifecycle controls
+3. Client resilience verification:
+   - add deeper browser/offline replay test coverage and URL-state recovery checks
+4. Performance gate enforcement:
+   - codify and run p95 latency gates required by Phase 1 exit criteria

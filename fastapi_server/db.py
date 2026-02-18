@@ -4,7 +4,9 @@ import argparse
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 
+from alembic.config import Config
 from sqlalchemy import (
     JSON,
     BigInteger,
@@ -19,10 +21,13 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    inspect,
     select,
+    text,
 )
 from sqlalchemy.orm import Session
 
+from alembic import command
 from fastapi_server.config import settings
 
 metadata = MetaData()
@@ -165,28 +170,53 @@ Index(
 )
 
 
-def get_engine():
-    return create_engine(settings.db_url, future=True)
+def get_engine(db_url: str | None = None):
+    return create_engine(db_url or settings.db_url, future=True)
 
 
 @contextmanager
-def session_scope():
-    engine = get_engine()
+def session_scope(db_url: str | None = None):
+    engine = get_engine(db_url)
     with Session(engine) as session:
         yield session
 
 
 def init_db() -> None:
     engine = get_engine()
-    metadata.create_all(engine)
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    should_stamp = False
+    if "alembic_version" not in tables and tables:
+        should_stamp = True
+    elif "alembic_version" in tables:
+        with engine.connect() as conn:
+            row = conn.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).first()
+        if row is None and (tables - {"alembic_version"}):
+            # Legacy/pre-Alembic schema with an empty version table.
+            should_stamp = True
+    if should_stamp:
+        command.stamp(_alembic_config(), "head")
+    upgrade_db()
+
+
+def _alembic_config(db_url: str | None = None) -> Config:
+    root = Path(__file__).resolve().parents[1]
+    cfg = Config(str(root / "alembic.ini"))
+    cfg.set_main_option("script_location", str(root / "alembic"))
+    cfg.set_main_option("sqlalchemy.url", db_url or settings.db_url)
+    return cfg
+
+
+def upgrade_db(revision: str = "head", db_url: str | None = None) -> None:
+    command.upgrade(_alembic_config(db_url), revision)
 
 
 def now_ms() -> int:
     return int(datetime.now(UTC).timestamp() * 1000)
 
 
-def ensure_dev_seed_users() -> None:
-    with session_scope() as session:
+def ensure_dev_seed_users(db_url: str | None = None) -> None:
+    with session_scope(db_url) as session:
         exists = session.execute(select(organization.c.id).limit(1)).first()
         if exists:
             return
@@ -311,8 +341,9 @@ def _cli() -> None:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("init")
+    sub.add_parser("upgrade")
     args = parser.parse_args()
-    if args.command == "init":
+    if args.command in {"init", "upgrade"}:
         init_db()
 
 
