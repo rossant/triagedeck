@@ -1,13 +1,13 @@
 # triagedeck Architecture (v1.3)
 
-This document describes the implementation architecture for `docs/spec.md` v1.3 and `docs/api.md`.
+This document defines the implementation architecture for `docs/spec.md` v1.3 and `docs/api.md`.
 
 ## 1. Goals
 
-- Preserve offline-first review reliability with deterministic event reconciliation.
-- Keep decisioning item-centric, with optional item variants for display.
+- Preserve offline-first review with deterministic reconciliation.
+- Keep decisions item-centric, while allowing variant-specific rendering.
 - Support reproducible export for external ML without in-product ML execution.
-- Keep backend pluggable for Django integration and standalone FastAPI.
+- Keep backend implementation portable between Django and standalone FastAPI.
 
 ## 2. System Context
 
@@ -21,260 +21,256 @@ Browser Client
         v
 REST API (/api/v1)
   - AuthN/AuthZ
-  - Project + Item + Decision APIs
-  - Export APIs
+  - Project + Item + Decision endpoints
+  - Export endpoints
         |
-        +--> StorageResolver (logical URI -> browser-usable URL)
+        +--> StorageResolver (logical URI -> browser URL)
         |
-        +--> DB (projects/items/variants/events/latest/export_jobs)
+        +--> DB (project/item/variant/event/latest/export_job)
         |
         +--> Export Worker (async snapshot packaging)
 ```
 
-## 3. Backend Components
+## 3. Backend Architecture
 
-## 3.1 API Layer
+### 3.1 API Layer
 
 Responsibilities:
 
-- Authentication and membership validation.
-- Role authorization.
-- Request validation and response shaping.
-- Cursor encoding/decoding.
-- Idempotent event ingestion contract.
+- Authenticate users and validate project membership.
+- Authorize actions by role and scope.
+- Validate requests and normalize response shape.
+- Encode/decode cursors.
+- Enforce idempotent decision ingest semantics.
 
-Completed:
-1. API parity hardening across FastAPI and Django adapter for cursor validation, export constraints, and role-scoped export visibility.
-2. Export pipeline hardening baseline with deterministic artifact generation, reproducible manifests, expiry cleanup, and audit hooks.
-3. Client resilience verification coverage for offline queue replay and URL state round-trip recovery.
-4. Performance gate enforcement via automated latency tests and `just test-perf`.
-5. Structured observability baseline:
-   - FastAPI and Django metrics snapshots exposed at `/metrics`
-   - Structured logging and in-memory latency/counter instrumentation for ingest/export flows
+Current status:
 
-Next:
-1. Expand contract tests for lifecycle edge cases and replay determinism.
-2. Tighten local/CI gate documentation and policies around environment-dependent skips.
-3. Extend observability depth with additional per-route/per-error dimensions and dashboards.
+- FastAPI and Django adapters follow the same API contract for cursor validation, export constraints, and role-scoped export visibility.
+- Export pipeline provides deterministic artifact generation, reproducible manifests, expiry cleanup, and audit hooks.
+- Offline replay and URL state round-trip resilience are covered by automated tests.
+- Performance gates are enforced through latency tests and `just test-perf`.
+- Metrics are exposed at `/metrics`; ingest/export flows emit structured logs and latency/counter signals.
 
-## 3.2 Domain Services
+Planned improvements:
 
-- `DecisionIngestService`
-  - validates events.
-  - persists `decision_event`.
-  - computes and applies `decision_latest`.
-- `DecisionQueryService`
-  - serves current-user latest decisions with cursor pagination.
-- `ItemQueryService`
-  - serves cursor item lists + variants.
-  - serves single-item deep-link hydration.
-- `ExportService`
-  - creates/lists/gets/cancels export jobs.
-  - enforces allowlist and export limits.
-- `StorageResolverService`
-  - resolves signed/stream URLs for item or variant media.
+- Expand contract tests for lifecycle edge cases and replay determinism.
+- Tighten CI/local gate policy around environment-dependent test skips.
+- Add route-level and error-level observability dimensions and dashboard coverage.
 
-## 3.3 Export Worker
+### 3.2 Domain Services
 
-Async worker process (or background task subsystem) that:
+- `DecisionIngestService`: validates events, appends `decision_event`, recomputes and upserts `decision_latest`.
+- `DecisionQueryService`: serves current-user latest decisions with cursor pagination.
+- `ItemQueryService`: serves item pages with variants and single-item deep-link hydration.
+- `ExportService`: creates, lists, fetches, and cancels export jobs; enforces allowlist and export limits.
+- `StorageResolverService`: resolves item/variant media into browser-usable signed or stream URLs.
 
-- transitions `export_job` status: `queued -> running -> ready/failed/expired`.
-- snapshots eligible rows at job start.
-- writes dataset + `manifest.json`.
-- computes `sha256`.
-- writes `file_uri` and `expires_at`.
-- enforces row/size limits.
+### 3.3 Export Worker
+
+Asynchronous worker (process or task subsystem) that:
+
+- Transitions `export_job` state: `queued -> running -> ready|failed|expired`.
+- Snapshots eligible rows at job start.
+- Writes dataset payload and `manifest.json`.
+- Computes artifact `sha256`.
+- Persists `file_uri` and `expires_at`.
+- Enforces row and artifact-size limits.
 
 ## 4. Data Model and Invariants
 
 Core entities:
 
-- `project`, `item`, `item_variant`, `decision_event`, `decision_latest`, `export_job`.
+- `project`
+- `item`
+- `item_variant`
+- `decision_event`
+- `decision_latest`
+- `export_job`
 
 Critical invariants:
 
 - `decision_event` is append-only and immutable.
-- event idempotency key: `(project_id, user_id, event_id)`.
-- latest state uniqueness: `(project_id, user_id, item_id)`.
-- variant uniqueness: `(item_id, variant_key)`.
-- decisions are item-level, never variant-level.
-- soft-deleted `project/item` excluded from default queries.
+- Event idempotency key is `(project_id, user_id, event_id)`.
+- Latest row uniqueness is `(project_id, user_id, item_id)`.
+- Variant uniqueness is `(item_id, variant_key)`.
+- Decisions are item-level, never variant-level.
+- Soft-deleted `project` or `item` rows are excluded from default reads.
 
 ## 5. Decision Consistency Model
 
-For same `(project_id, user_id, item_id)`, winning event order:
+For a fixed `(project_id, user_id, item_id)`, winner ordering is:
 
-1. highest `ts_client_effective`
-2. tie-break highest `ts_server`
-3. tie-break highest lexicographic `event_id`
+1. Highest `ts_client_effective`
+2. Then highest `ts_server`
+3. Then highest lexicographic `event_id`
 
 `ts_client` handling:
 
-- validate against skew window (+/-24h default).
-- clamp to window for `ts_client_effective`.
-- persist both original `ts_client` and `ts_client_effective`.
+- Validate against skew window (default `+/-24h`).
+- Clamp to window as `ts_client_effective`.
+- Persist both `ts_client` and `ts_client_effective`.
 
-Write path rule:
+Write-order rule:
 
-- persist event first, then update latest.
+- Persist event first, then recompute/update latest state.
 
-## 6. API Read/Write Flows
+## 6. API Flows
 
-## 6.1 Decision Ingest
+### 6.1 Decision Ingest
 
-1. Client submits batch to `POST /projects/{project_id}/events`.
-2. API authenticates and validates each event.
-3. For each event:
-   - if duplicate idempotency key => `duplicate`.
-   - else persist event + recompute latest winner.
-4. Return per-event results with partial success semantics.
+1. Client submits a batch to `POST /projects/{project_id}/events`.
+2. API authenticates caller and validates each event.
+3. API checks idempotency key `(project_id, user_id, event_id)` for each event.
+4. Duplicate events return `duplicate`.
+5. Non-duplicate events are appended and latest winners are recomputed.
+6. API returns per-event results with partial-success semantics.
 
-## 6.2 Resume Decisions
+### 6.2 Resume Decisions
 
 1. Client calls `GET /projects/{project_id}/decisions?cursor&limit`.
-2. API reads `decision_latest` for `request.user.id`.
-3. API returns ordered page + `next_cursor`.
+2. API reads `decision_latest` for the requesting user.
+3. API returns ordered rows plus `next_cursor`.
 
-## 6.3 URL Deep-Link Hydration
+### 6.3 URL Deep-Link Hydration
 
-1. Client parses URL canonical state (`item`, variants, compare, reveal, zoom/pan).
-2. If target item missing from in-memory page, call `GET /projects/{project_id}/items/{item_id}`.
-3. Render state and clamp/fallback invalid params.
+1. Client parses canonical URL state (`item`, variants, compare, reveal, zoom/pan).
+2. If target item is missing locally, client calls `GET /projects/{project_id}/items/{item_id}`.
+3. Client renders resolved state and clamps/falls back invalid parameters.
 
-## 6.4 External ML Export
+### 6.4 External ML Export
 
-1. User creates job via `POST /projects/{project_id}/exports`.
+1. User creates a job with `POST /projects/{project_id}/exports`.
 2. API validates role, filters, and allowlisted fields.
-3. Job enqueued in `export_job`.
-4. Worker builds snapshot package.
-5. Client polls `GET /exports/{id}` until `ready`.
-6. Client downloads artifact via short-lived URL.
+3. API enqueues a row in `export_job`.
+4. Worker builds a consistent snapshot package.
+5. Client polls `GET /exports/{id}` until state is `ready`.
+6. Client downloads artifact through a short-lived URL.
 
 ## 7. Client Architecture
 
-## 7.1 State Domains
+### 7.1 State Domains
 
-- `server_state`: items, decisions, config.
-- `local_sync_state`: pending events, sync status, retry metadata.
-- `view_state`: canonical URL params (item/variant/compare/reveal/zoom/pan).
+- `server_state`: items, decisions, server-provided config.
+- `local_sync_state`: pending events, retry metadata, sync status.
+- `view_state`: canonical URL params (`item`, `variant`, `compare`, `reveal`, `zoom`, `pan`).
 
-## 7.2 URLStateManager
+### 7.2 URLStateManager
 
 Responsibilities:
 
-- Parse URL on load.
-- Validate/clamp bounds.
-- Apply defaults.
-- Write updates with:
-  - history `replace` for local view changes.
-  - history `push` for item navigation.
-- Prevent write/read loops via change origin tagging.
+- Parse URL state at load.
+- Validate bounds and apply defaults.
+- Update history with `replace` for local view changes.
+- Update history with `push` for item navigation.
+- Prevent write/read loops with origin tagging.
 
-## 7.3 SyncManager
+### 7.3 SyncManager
 
-- Sends pending events in batches (max 200).
-- Exponential backoff (500ms base, 30s max, full jitter).
-- Resets backoff on success.
-- Maintains banner state: `SYNC_OK`, `SYNCING`, `SYNC_ERROR`.
+- Sends pending events in bounded batches (max 200).
+- Uses exponential backoff (500 ms base, 30 s max, full jitter).
+- Resets backoff after successful flush.
+- Maintains user-visible sync state: `SYNC_OK`, `SYNCING`, `SYNC_ERROR`.
 
-## 7.4 Renderer Layer
+### 7.4 Renderer Layer
 
-- `RendererRegistry` routes by media type.
-- Image renderer supports:
-  - variant switching (up/down + wheel).
-  - compare mode (2 variants).
-  - reveal divider (0..100 with keyboard nudge).
-- Review hotkeys remain responsive during rendering actions.
+- `RendererRegistry` dispatches by media type.
+- Image renderer supports variant switching (keyboard and wheel), two-variant compare mode, and reveal divider (`0..100`) with keyboard nudging.
+- Review hotkeys remain responsive during rendering operations.
 
 ## 8. Storage and URL Strategy
 
-- DB stores logical URIs.
-- API resolves browser-usable URLs at read time.
-- Signed URL TTL default 15 min.
-- Refresh endpoint supports optional `variant_key`.
-- URLs in browser query params must never contain signed URLs or credentials.
+- Database stores logical media URIs, never embed credentials in persistent fields.
+- API resolves logical URIs into browser-usable URLs at read time.
+- Signed URL TTL default is 15 minutes.
+- URL refresh endpoint supports optional `variant_key`.
+- Browser query params must never contain signed URLs or credentials.
 
-## 9. Export Architecture for External ML
+## 9. External ML Export Package
 
-Output package:
+Output files:
 
 - `dataset.<ext>`
 - `manifest.json`
 
-Manifest minimum:
+Manifest minimum fields:
 
-- `snapshot_at`, `project_id`, `decision_schema_version`,
-- `label_policy`, `filters`, `row_count`, `sha256`.
+- `snapshot_at`
+- `project_id`
+- `decision_schema_version`
+- `label_policy`
+- `filters`
+- `row_count`
+- `sha256`
 
-Security/governance:
+Security and governance:
 
-- allowlist-driven field inclusion.
-- audit log each export request.
-- access policy for job creation/download.
-- artifact TTL cleanup job marks stale artifacts `expired`.
+- Allowlist-driven field inclusion.
+- Audit log per export request.
+- Access policy on create/download operations.
+- TTL cleanup marks stale artifacts as `expired`.
 
-## 10. Operational Concerns
+## 10. Operations
 
-## 10.1 Background Jobs
+### 10.1 Background Jobs
 
 - Export worker queue.
-- Expiry sweeper for export artifacts.
+- Expiry sweeper for stale export artifacts.
 
-## 10.2 Observability
+### 10.2 Observability
 
 Logs:
 
-- include request id + project/user/session/event/export ids where available.
+- Include request ID plus project/user/session/event/export IDs where available.
 
 Metrics:
 
-- decision ingest throughput.
-- duplicate/reject rates.
-- sync p95 round-trip.
-- export duration/failure/bytes.
+- Decision ingest throughput.
+- Duplicate/reject rates.
+- Sync round-trip p95.
+- Export duration, failure count, and artifact bytes.
 
-## 10.3 Scalability
+### 10.3 Scalability Constraints
 
-- cursor pagination only.
-- indexed access patterns per spec.
-- bounded batch/event sizes.
-- bounded export concurrency and artifact size.
+- Cursor pagination only.
+- Indexed access patterns required by spec.
+- Bounded batch size and event payload size.
+- Bounded export concurrency and artifact size.
 
 ## 11. Failure Modes and Recovery
 
-- Duplicate event replay: absorbed via idempotency key.
-- Out-of-order event arrival: converges via deterministic ordering.
-- Client crash while offline: replay from IndexedDB pending queue.
-- Expired media URL: refresh via item URL endpoint.
-- Export job failure: visible as `failed`; retry creates a new job.
-- Export cancellation: idempotent delete operation.
+- Duplicate event replay is absorbed by idempotency key.
+- Out-of-order event arrival converges through deterministic winner ordering.
+- Offline client crash recovers by replaying IndexedDB pending queue.
+- Expired media URLs recover via URL refresh endpoint.
+- Failed export jobs remain visible as `failed`; retries create new jobs.
+- Export cancellation is idempotent.
 
-## 12. Implementation Modes
+## 12. Deployment Modes
 
-## 12.1 Django Integration
+### 12.1 Django Integration
 
-- app module: models/views/urls/permissions.
-- uses existing `AUTH_USER_MODEL` and sessions.
-- migrations applied into existing DB.
+- Django app module with models/views/urls/permissions.
+- Reuses existing `AUTH_USER_MODEL` and session stack.
+- Applies migrations in existing database.
 
-## 12.2 FastAPI Standalone
+### 12.2 FastAPI Standalone
 
-- SQLAlchemy models + Alembic.
-- token/header auth adapter.
-- same endpoint contract and behavior as Django mode.
+- SQLAlchemy models plus Alembic migrations.
+- Token/header auth adapter.
+- Same endpoint contract and behavior as Django mode.
 
-## 13. Phase 1 Boundaries
+## 13. Phase 1 Scope
 
-In:
+In scope:
 
-- image-first review.
-- decision schema + offline sync.
-- URL canonical state.
-- local browser export/import.
-- external ML export jobs and artifact download.
+- Image-first review flow.
+- Decision schema and offline sync.
+- Canonical URL state.
+- Local browser export/import.
+- External ML export jobs and artifact download.
 
-Out:
+Out of scope:
 
-- in-product ML model training/serving/auto-decisioning.
-- advanced adjudication workflows.
-- plugin-heavy domain renderers.
+- In-product model training/serving/auto-decisioning.
+- Advanced adjudication workflows.
+- Plugin-heavy domain renderer ecosystem.
