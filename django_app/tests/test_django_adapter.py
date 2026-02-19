@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import uuid
+from pathlib import Path
 
 import pytest
 
+from django_app import views
 from django_app.models import ExportJob, Item, Organization, Project, ProjectMembership, Role
 
 
@@ -77,11 +79,28 @@ def seeded_project(reviewer, viewer, admin):
     }
 
 
+@pytest.fixture(autouse=True)
+def export_artifact_dirs(tmp_path, monkeypatch):
+    base = tmp_path / "exports"
+    monkeypatch.setattr(views.export_store, "base_dir", base)
+    monkeypatch.setattr(views.export_store, "audit_log_path", base / "audit.log")
+    yield
+
+
 @pytest.mark.django_db
 def test_projects_requires_auth(client, seeded_project):
     response = client.get("/api/v1/projects")
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "unauthorized"
+
+
+@pytest.mark.django_db
+def test_metrics_endpoint_available(client):
+    response = client.get("/metrics")
+    assert response.status_code == 200
+    body = response.json()
+    assert "counters" in body
+    assert "timings_ms" in body
 
 
 @pytest.mark.django_db
@@ -99,6 +118,15 @@ def test_items_invalid_cursor(client, reviewer, seeded_project):
     response = client.get(f"/api/v1/projects/{project.id}/items?cursor=bad")
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_cursor"
+
+
+@pytest.mark.django_db
+def test_items_invalid_limit(client, reviewer, seeded_project):
+    project = seeded_project["project"]
+    client.force_login(reviewer)
+    response = client.get(f"/api/v1/projects/{project.id}/items?limit=oops")
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "bad_request"
 
 
 @pytest.mark.django_db
@@ -239,6 +267,16 @@ def test_export_access_scope_creator_vs_admin(client, reviewer, viewer, admin, s
     assert allowed.status_code == 200
     assert allowed.json()["export_id"] == export_id
 
+    client.force_login(viewer)
+    listing = client.get(f"/api/v1/projects/{project.id}/exports")
+    assert listing.status_code == 200
+    assert all(row["export_id"] != export_id for row in listing.json()["exports"])
+
+    client.force_login(admin)
+    listing = client.get(f"/api/v1/projects/{project.id}/exports")
+    assert listing.status_code == 200
+    assert any(row["export_id"] == export_id for row in listing.json()["exports"])
+
 
 @pytest.mark.django_db
 def test_export_expiry_behavior(client, reviewer, seeded_project):
@@ -262,3 +300,140 @@ def test_export_expiry_behavior(client, reviewer, seeded_project):
     expired = client.get(f"/api/v1/projects/{project.id}/exports/{export_id}")
     assert expired.status_code == 410
     assert expired.json()["error"]["code"] == "export_expired"
+
+
+@pytest.mark.django_db
+def test_export_concurrency_limit(client, reviewer, seeded_project):
+    project = seeded_project["project"]
+    ExportJob.objects.create(
+        project=project,
+        requested_by_user=reviewer,
+        status=ExportJob.STATUS_QUEUED,
+        mode=ExportJob.MODE_LABELS_ONLY,
+        label_policy="latest_per_user",
+        format="jsonl",
+        filters_json={},
+        include_fields_json=[],
+        created_at=1,
+    )
+    ExportJob.objects.create(
+        project=project,
+        requested_by_user=reviewer,
+        status=ExportJob.STATUS_RUNNING,
+        mode=ExportJob.MODE_LABELS_ONLY,
+        label_policy="latest_per_user",
+        format="jsonl",
+        filters_json={},
+        include_fields_json=[],
+        created_at=2,
+    )
+    client.force_login(reviewer)
+    response = client.post(
+        f"/api/v1/projects/{project.id}/exports",
+        data=json.dumps(
+            {
+                "mode": "labels_only",
+                "label_policy": "latest_per_user",
+                "format": "jsonl",
+                "filters": {},
+                "include_fields": ["item_id", "external_id", "decision_id", "note", "ts_server"],
+            }
+        ),
+        content_type="application/json",
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "export_limit_exceeded"
+
+
+@pytest.mark.django_db
+def test_export_manifest_hash_deterministic(client, reviewer, seeded_project):
+    project = seeded_project["project"]
+    item = seeded_project["item"]
+    client.force_login(reviewer)
+
+    event_payload = {
+        "client_id": str(uuid.uuid4()),
+        "session_id": str(uuid.uuid4()),
+        "events": [
+            {
+                "event_id": str(uuid.uuid4()),
+                "item_id": str(item.id),
+                "decision_id": "pass",
+                "note": "n1",
+                "ts_client": 1739472000000,
+            }
+        ],
+    }
+    ev = client.post(
+        f"/api/v1/projects/{project.id}/events",
+        data=json.dumps(event_payload),
+        content_type="application/json",
+    )
+    assert ev.status_code == 200
+
+    body = {
+        "mode": "labels_only",
+        "label_policy": "latest_per_user",
+        "format": "jsonl",
+        "filters": {},
+        "include_fields": ["item_id", "external_id", "decision_id", "note", "ts_server"],
+    }
+    create1 = client.post(
+        f"/api/v1/projects/{project.id}/exports",
+        data=json.dumps(body),
+        content_type="application/json",
+    )
+    create2 = client.post(
+        f"/api/v1/projects/{project.id}/exports",
+        data=json.dumps(body),
+        content_type="application/json",
+    )
+    assert create1.status_code == 200
+    assert create2.status_code == 200
+
+    e1 = ExportJob.objects.get(id=create1.json()["export_id"])
+    e2 = ExportJob.objects.get(id=create2.json()["export_id"])
+    assert e1.manifest_json["sha256"] == e2.manifest_json["sha256"]
+    assert e1.manifest_json["row_count"] == e2.manifest_json["row_count"]
+
+    path1 = views.export_store.base_dir / Path(e1.file_uri).name
+    path2 = views.export_store.base_dir / Path(e2.file_uri).name
+    assert path1.exists()
+    assert path2.exists()
+    assert path1.read_bytes() == path2.read_bytes()
+
+
+@pytest.mark.django_db
+def test_expired_export_cleanup_removes_artifacts_and_audits(client, reviewer, seeded_project):
+    project = seeded_project["project"]
+    client.force_login(reviewer)
+    create = client.post(
+        f"/api/v1/projects/{project.id}/exports",
+        data=json.dumps(
+            {
+                "mode": "labels_only",
+                "label_policy": "latest_per_user",
+                "format": "jsonl",
+                "filters": {},
+                "include_fields": ["item_id", "external_id", "decision_id", "note", "ts_server"],
+            }
+        ),
+        content_type="application/json",
+    )
+    assert create.status_code == 200
+    export_id = create.json()["export_id"]
+    row = ExportJob.objects.get(id=export_id)
+    dataset_path = views.export_store.base_dir / Path(row.file_uri).name
+    assert dataset_path.exists()
+
+    ExportJob.objects.filter(id=export_id).update(expires_at=1)
+    listing = client.get(f"/api/v1/projects/{project.id}/exports")
+    assert listing.status_code == 200
+    updated = ExportJob.objects.get(id=export_id)
+    assert updated.status == ExportJob.STATUS_EXPIRED
+    assert not dataset_path.exists()
+
+    audit_log = views.export_store.audit_log_path
+    assert audit_log.exists()
+    log_text = audit_log.read_text(encoding="utf-8")
+    assert "export_expired_cleanup" in log_text

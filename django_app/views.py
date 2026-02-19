@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 import uuid
 
 from django.db import transaction
@@ -10,6 +11,7 @@ from django.http import Http404, JsonResponse
 from django.utils import timezone
 from django.views.decorators.http import require_http_methods
 
+from django_app.export_storage import ExportStorage
 from django_app.models import (
     DecisionEvent,
     DecisionLatest,
@@ -19,11 +21,15 @@ from django_app.models import (
     Project,
     Role,
 )
+from django_app.observability import increment, log_event, observe_ms, snapshot
 from django_app.permissions import can_write_events, project_role_or_404, require_auth
 
 CURSOR_TTL_MS = 7 * 24 * 60 * 60 * 1000
 SKEW_WINDOW_MS = 24 * 60 * 60 * 1000
 EXPORT_TTL_MS = 7 * 24 * 60 * 60 * 1000
+EXPORT_MAX_ROWS = 1_000_000
+EXPORT_MAX_BYTES = 5 * 1024 * 1024 * 1024
+EXPORT_MAX_CONCURRENT_PER_USER = 2
 DEFAULT_EXPORT_ALLOWLIST = {
     "item_id",
     "external_id",
@@ -34,10 +40,17 @@ DEFAULT_EXPORT_ALLOWLIST = {
     "metadata.subject_id",
     "metadata.session_id",
 }
+DEFAULT_EXPORT_FIELDS = ["item_id", "external_id", "decision_id", "note", "ts_server"]
+export_store = ExportStorage()
 
 
 def now_ms() -> int:
     return int(timezone.now().timestamp() * 1000)
+
+
+@require_http_methods(["GET"])
+def metrics_view(request):
+    return JsonResponse(snapshot())
 
 
 def api_error(status: int, code: str, message: str, details: dict | None = None):
@@ -53,21 +66,39 @@ def api_error(status: int, code: str, message: str, details: dict | None = None)
     )
 
 
-def decode_cursor(value: str | None):
+def decode_cursor(value: str | None, required_keys: tuple[str, ...]):
     if not value:
         return None
     try:
         payload = json.loads(base64.urlsafe_b64decode(value.encode("utf-8")).decode("utf-8"))
     except Exception as exc:
         raise ValueError("invalid_cursor") from exc
-    if payload.get("exp", 0) < now_ms():
+    exp = payload.get("exp")
+    cursor_payload = payload.get("payload")
+    if not isinstance(exp, int):
         raise ValueError("invalid_cursor")
-    return payload.get("payload")
+    if exp < now_ms():
+        raise ValueError("invalid_cursor")
+    if not isinstance(cursor_payload, dict):
+        raise ValueError("invalid_cursor")
+    if any(k not in cursor_payload for k in required_keys):
+        raise ValueError("invalid_cursor")
+    return cursor_payload
 
 
 def encode_cursor(payload: dict):
     raw = json.dumps({"payload": payload, "exp": now_ms() + CURSOR_TTL_MS}).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("utf-8")
+
+
+def parse_limit(raw_value: str | None, *, default: int, min_value: int, max_value: int) -> int:
+    if raw_value is None:
+        return default
+    try:
+        raw = int(raw_value)
+    except ValueError as exc:
+        raise ValueError("bad_request") from exc
+    return min(max(raw, min_value), max_value)
 
 
 def item_to_json(row: Item):
@@ -160,12 +191,12 @@ def items_list(request, project_id):
         return api_error(404, "not_found", "Resource not found")
 
     try:
-        limit = min(max(int(request.GET.get("limit", "100")), 1), 200)
+        limit = parse_limit(request.GET.get("limit"), default=100, min_value=1, max_value=200)
     except ValueError:
         return api_error(400, "bad_request", "Invalid limit")
 
     try:
-        cursor = decode_cursor(request.GET.get("cursor"))
+        cursor = decode_cursor(request.GET.get("cursor"), ("sort_key", "item_id"))
     except ValueError:
         return api_error(400, "invalid_cursor", "Cursor is invalid or expired")
 
@@ -243,8 +274,52 @@ def _parse_json_body(request):
         return None
 
 
+def _cleanup_expired_exports(project_id) -> None:
+    now = now_ms()
+    rows = list(
+        ExportJob.objects.filter(
+            project_id=project_id,
+            expires_at__lt=now,
+        )
+        .exclude(status=ExportJob.STATUS_EXPIRED)
+        .only("id", "file_uri")
+    )
+    for row in rows:
+        if row.file_uri:
+            export_store.remove_artifacts_for_uri(row.file_uri)
+        ExportJob.objects.filter(id=row.id).update(
+            status=ExportJob.STATUS_EXPIRED,
+            completed_at=now,
+        )
+        export_store.audit("export_expired_cleanup", {"export_id": str(row.id)})
+
+
+def _normalize_include_fields(include_fields: list[str]) -> list[str]:
+    return include_fields or DEFAULT_EXPORT_FIELDS
+
+
+def _extract_export_value(field: str, row: DecisionLatest):
+    if field == "item_id":
+        return str(row.item_id)
+    if field == "external_id":
+        return row.item.external_id
+    if field == "decision_id":
+        return row.decision_id
+    if field == "note":
+        return row.note
+    if field == "ts_server":
+        return row.ts_server
+    if field == "variant_key":
+        return None
+    if field.startswith("metadata."):
+        key = field.split(".", 1)[1]
+        return (row.item.metadata_json or {}).get(key)
+    return None
+
+
 @require_http_methods(["POST"])
 def events_post(request, project_id):
+    t0 = time.perf_counter()
     try:
         ctx = require_auth(request)
         role = project_role_or_404(project_id, ctx.user_id)
@@ -302,7 +377,12 @@ def events_post(request, project_id):
                 results.append({"event_id": event_id, "status": "duplicate"})
                 continue
 
-            if not item_id or uuid.UUID(item_id) not in item_ids:
+            try:
+                parsed_item_id = uuid.UUID(item_id) if item_id else None
+            except (ValueError, TypeError):
+                parsed_item_id = None
+
+            if parsed_item_id not in item_ids:
                 rejected += 1
                 results.append(
                     {
@@ -339,7 +419,7 @@ def events_post(request, project_id):
             high = server_ts + SKEW_WINDOW_MS
             ts_client_effective = max(low, min(high, ts_client))
 
-            item = Item.objects.get(id=item_id)
+            item = Item.objects.get(id=parsed_item_id)
             DecisionEvent.objects.create(
                 project_id=project_id,
                 user_id=ctx.user_id,
@@ -379,6 +459,19 @@ def events_post(request, project_id):
             accepted += 1
             results.append({"event_id": event_id, "status": "accepted"})
 
+    increment("events.ingest.calls")
+    increment("events.ingest.accepted", accepted)
+    increment("events.ingest.duplicate", duplicate)
+    increment("events.ingest.rejected", rejected)
+    observe_ms("events.ingest.latency_ms", (time.perf_counter() - t0) * 1000.0)
+    log_event(
+        "events.ingest",
+        project_id=str(project_id),
+        user_id=ctx.user_id,
+        accepted=accepted,
+        duplicate=duplicate,
+        rejected=rejected,
+    )
     return JsonResponse(
         {
             "acked": accepted + duplicate,
@@ -400,6 +493,7 @@ def _export_visible_queryset(project_id, user_id: int, role: str):
 
 @require_http_methods(["POST"])
 def exports_create(request, project_id):
+    t0 = time.perf_counter()
     try:
         ctx = require_auth(request)
         role = project_role_or_404(project_id, ctx.user_id)
@@ -414,12 +508,21 @@ def exports_create(request, project_id):
     body = _parse_json_body(request)
     if body is None:
         return api_error(400, "bad_request", "Invalid JSON body")
+    _cleanup_expired_exports(project_id)
 
     project = Project.objects.filter(id=project_id, deleted_at__isnull=True).first()
     if not project:
         return api_error(404, "not_found", "Resource not found")
 
-    include_fields = body.get("include_fields") or []
+    include_fields = _normalize_include_fields(body.get("include_fields") or [])
+    running_count = ExportJob.objects.filter(
+        project_id=project_id,
+        requested_by_user_id=ctx.user_id,
+        status__in=[ExportJob.STATUS_QUEUED, ExportJob.STATUS_RUNNING],
+    ).count()
+    if running_count >= EXPORT_MAX_CONCURRENT_PER_USER:
+        return api_error(422, "export_limit_exceeded", "Too many concurrent export jobs")
+
     allowlist = set((project.config_json or {}).get("export_allowlist", []))
     if not allowlist:
         allowlist = DEFAULT_EXPORT_ALLOWLIST
@@ -428,16 +531,41 @@ def exports_create(request, project_id):
             return api_error(422, "field_not_allowlisted", f"Field not allowlisted: {field}")
 
     created_at = now_ms()
-    row_count = DecisionLatest.objects.filter(project_id=project_id).count()
+    rows = list(
+        DecisionLatest.objects.filter(project_id=project_id)
+        .select_related("item")
+        .order_by("ts_server", "item_id")
+    )
+    row_count = len(rows)
+    if row_count > EXPORT_MAX_ROWS:
+        return api_error(422, "export_limit_exceeded", "Export exceeds max rows")
+
+    export_rows = [
+        {field: _extract_export_value(field, row) for field in include_fields} for row in rows
+    ]
     manifest = {
         "snapshot_at": created_at,
         "project_id": str(project_id),
         "decision_schema_version": (project.decision_schema_json or {}).get("version", 1),
         "label_policy": body.get("label_policy", "latest_per_user"),
         "filters": body.get("filters", {}),
+        "include_fields": include_fields,
         "row_count": row_count,
         "sha256": "",
     }
+
+    artifact = export_store.write_bundle(
+        project_id=str(project_id),
+        snapshot_at=created_at,
+        fmt=body.get("format", "jsonl"),
+        include_fields=include_fields,
+        rows=export_rows,
+        manifest=manifest,
+    )
+    if artifact.size_bytes > EXPORT_MAX_BYTES:
+        export_store.remove_artifacts_for_uri(artifact.file_uri)
+        return api_error(422, "export_limit_exceeded", "Export exceeds max file size")
+    manifest["sha256"] = artifact.sha256
 
     job = ExportJob.objects.create(
         project_id=project_id,
@@ -449,16 +577,36 @@ def exports_create(request, project_id):
         filters_json=body.get("filters", {}),
         include_fields_json=include_fields,
         manifest_json=manifest,
-        file_uri=f"/exports/{project_id}/{created_at}.jsonl",
+        file_uri=artifact.file_uri,
         expires_at=created_at + EXPORT_TTL_MS,
         created_at=created_at,
         completed_at=created_at,
+    )
+    export_store.audit(
+        "export_ready",
+        {
+            "export_id": str(job.id),
+            "project_id": str(project_id),
+            "row_count": artifact.row_count,
+            "sha256": artifact.sha256,
+        },
+    )
+    increment("exports.create.calls")
+    increment("exports.create.ready", 1)
+    observe_ms("exports.create.latency_ms", (time.perf_counter() - t0) * 1000.0)
+    log_event(
+        "exports.create",
+        project_id=str(project_id),
+        user_id=ctx.user_id,
+        export_id=str(job.id),
+        row_count=artifact.row_count,
     )
     return JsonResponse({"export_id": str(job.id), "status": "queued"})
 
 
 @require_http_methods(["GET"])
 def exports_list(request, project_id):
+    t0 = time.perf_counter()
     try:
         ctx = require_auth(request)
         role = project_role_or_404(project_id, ctx.user_id)
@@ -467,13 +615,14 @@ def exports_list(request, project_id):
     except Http404:
         return api_error(404, "not_found", "Resource not found")
 
+    _cleanup_expired_exports(project_id)
     try:
-        limit = min(max(int(request.GET.get("limit", "50")), 1), 100)
+        limit = parse_limit(request.GET.get("limit"), default=50, min_value=1, max_value=100)
     except ValueError:
         return api_error(400, "bad_request", "Invalid limit")
 
     try:
-        cursor = decode_cursor(request.GET.get("cursor"))
+        cursor = decode_cursor(request.GET.get("cursor"), ("created_at", "id"))
     except ValueError:
         return api_error(400, "invalid_cursor", "Cursor is invalid or expired")
 
@@ -489,6 +638,8 @@ def exports_list(request, project_id):
         last = rows[-1]
         next_cursor = encode_cursor({"created_at": last.created_at, "id": str(last.id)})
 
+    increment("exports.list.calls")
+    observe_ms("exports.list.latency_ms", (time.perf_counter() - t0) * 1000.0)
     return JsonResponse(
         {
             "exports": [
@@ -508,6 +659,7 @@ def exports_list(request, project_id):
 
 @require_http_methods(["GET"])
 def exports_get(request, project_id, export_id):
+    t0 = time.perf_counter()
     try:
         ctx = require_auth(request)
         role = project_role_or_404(project_id, ctx.user_id)
@@ -516,6 +668,7 @@ def exports_get(request, project_id, export_id):
     except Http404:
         return api_error(404, "not_found", "Resource not found")
 
+    _cleanup_expired_exports(project_id)
     row = ExportJob.objects.filter(id=export_id, project_id=project_id).first()
     if not row:
         return api_error(404, "not_found", "Resource not found")
@@ -524,7 +677,7 @@ def exports_get(request, project_id, export_id):
     if row.expires_at and row.expires_at < now_ms():
         return api_error(410, "export_expired", "Export has expired")
 
-    return JsonResponse(
+    out = JsonResponse(
         {
             "export_id": str(row.id),
             "status": row.status,
@@ -535,10 +688,14 @@ def exports_get(request, project_id, export_id):
             "expires_at": row.expires_at,
         }
     )
+    increment("exports.get.calls")
+    observe_ms("exports.get.latency_ms", (time.perf_counter() - t0) * 1000.0)
+    return out
 
 
 @require_http_methods(["DELETE"])
 def exports_cancel(request, project_id, export_id):
+    t0 = time.perf_counter()
     try:
         ctx = require_auth(request)
         role = project_role_or_404(project_id, ctx.user_id)
@@ -547,6 +704,7 @@ def exports_cancel(request, project_id, export_id):
     except Http404:
         return api_error(404, "not_found", "Resource not found")
 
+    _cleanup_expired_exports(project_id)
     row = ExportJob.objects.filter(id=export_id, project_id=project_id).first()
     if not row:
         return api_error(404, "not_found", "Resource not found")
@@ -558,10 +716,18 @@ def exports_cancel(request, project_id, export_id):
     if row.status in {ExportJob.STATUS_FAILED, ExportJob.STATUS_EXPIRED}:
         return JsonResponse({"status": row.status})
 
+    if row.file_uri:
+        export_store.remove_artifacts_for_uri(row.file_uri)
     row.status = ExportJob.STATUS_FAILED
     row.error_code = "export_cancelled"
     row.completed_at = now_ms()
     row.save(update_fields=["status", "error_code", "completed_at"])
+    export_store.audit(
+        "export_cancelled",
+        {"export_id": str(row.id), "project_id": str(project_id)},
+    )
+    increment("exports.cancel.calls")
+    observe_ms("exports.cancel.latency_ms", (time.perf_counter() - t0) * 1000.0)
     return JsonResponse({"status": "failed", "error": {"code": "export_cancelled"}})
 
 
@@ -590,12 +756,12 @@ def decisions_list(request, project_id):
         return api_error(404, "not_found", "Resource not found")
 
     try:
-        limit = min(max(int(request.GET.get("limit", "500")), 1), 2000)
+        limit = parse_limit(request.GET.get("limit"), default=500, min_value=1, max_value=2000)
     except ValueError:
         return api_error(400, "bad_request", "Invalid limit")
 
     try:
-        cursor = decode_cursor(request.GET.get("cursor"))
+        cursor = decode_cursor(request.GET.get("cursor"), ("ts_server", "item_id"))
     except ValueError:
         return api_error(400, "invalid_cursor", "Cursor is invalid or expired")
 

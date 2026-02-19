@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import uuid
 
 import pytest
@@ -14,8 +15,10 @@ from fastapi_server.main import (
     get_export,
     ingest_events,
     list_decisions,
+    list_exports,
     list_items,
     list_projects,
+    metrics,
 )
 from fastapi_server.schemas import EventsIngestRequest, ExportCreateRequest
 from scripts.seed import main as seed_main
@@ -72,6 +75,25 @@ def test_items_invalid_cursor():
     assert exc.value.detail["error"]["code"] == "invalid_cursor"
 
 
+def test_items_invalid_cursor_shape():
+    pid = _project_id()
+    user = User(user_id="reviewer@example.com", email="reviewer@example.com")
+    bad_cursor = "eyJwYXlsb2FkIjpbXSwiZXhwIjo0MTAyNDQ0ODAwMDAwfQ=="
+    with pytest.raises(HTTPException) as exc:
+        list_items(project_id=pid, cursor=bad_cursor, limit=5, user=user)
+    assert exc.value.status_code == 400
+    assert exc.value.detail["error"]["code"] == "invalid_cursor"
+
+
+def test_items_invalid_limit():
+    pid = _project_id()
+    user = User(user_id="reviewer@example.com", email="reviewer@example.com")
+    with pytest.raises(HTTPException) as exc:
+        list_items(project_id=pid, cursor=None, limit="nope", user=user)
+    assert exc.value.status_code == 400
+    assert exc.value.detail["error"]["code"] == "bad_request"
+
+
 def test_event_idempotency_and_resume():
     pid = _project_id()
     iid = _first_item_id()
@@ -87,7 +109,7 @@ def test_event_idempotency_and_resume():
                 "item_id": iid,
                 "decision_id": "pass",
                 "note": "ok",
-                "ts_client": 1739472000000,
+                "ts_client": int(time.time() * 1000),
             }
         ],
     )
@@ -182,3 +204,61 @@ def test_cancel_ready_export_conflicts():
     with pytest.raises(HTTPException) as exc:
         cancel_export(project_id=pid, export_id=created["export_id"], user=user)
     assert exc.value.status_code == 409
+
+
+def test_export_list_visibility_scoped_to_creator_unless_admin():
+    pid = _project_id()
+    reviewer = User(user_id="reviewer@example.com", email="reviewer@example.com")
+    viewer = User(user_id="viewer@example.com", email="viewer@example.com")
+    admin = User(user_id="admin@example.com", email="admin@example.com")
+    created = create_export(
+        project_id=pid,
+        body=ExportCreateRequest(
+            mode="labels_only",
+            label_policy="latest_per_user",
+            format="jsonl",
+            filters={},
+            include_fields=["item_id", "external_id", "decision_id", "note", "ts_server"],
+        ),
+        user=reviewer,
+    )
+    reviewer_list = list_exports(project_id=pid, cursor=None, limit=50, user=reviewer)
+    assert any(e["export_id"] == created["export_id"] for e in reviewer_list["exports"])
+    viewer_list = list_exports(project_id=pid, cursor=None, limit=50, user=viewer)
+    assert all(e["export_id"] != created["export_id"] for e in viewer_list["exports"])
+    admin_list = list_exports(project_id=pid, cursor=None, limit=50, user=admin)
+    assert any(e["export_id"] == created["export_id"] for e in admin_list["exports"])
+
+
+def test_metrics_snapshot_contains_core_counters():
+    pid = _project_id()
+    iid = _first_item_id()
+    user = User(user_id="reviewer@example.com", email="reviewer@example.com")
+    payload = EventsIngestRequest(
+        client_id=str(uuid.uuid4()),
+        session_id=str(uuid.uuid4()),
+        events=[
+            {
+                "event_id": str(uuid.uuid4()),
+                "item_id": iid,
+                "decision_id": "pass",
+                "note": "",
+                "ts_client": int(time.time() * 1000),
+            }
+        ],
+    )
+    ingest_events(project_id=pid, payload=payload, user=user)
+    create_export(
+        project_id=pid,
+        body=ExportCreateRequest(
+            mode="labels_only",
+            label_policy="latest_per_user",
+            format="jsonl",
+            filters={},
+            include_fields=["item_id", "external_id", "decision_id", "note", "ts_server"],
+        ),
+        user=user,
+    )
+    snap = metrics()
+    assert snap["counters"].get("events.ingest.calls", 0) >= 1
+    assert snap["counters"].get("exports.create.calls", 0) >= 1

@@ -4,21 +4,9 @@ import csv
 import hashlib
 import json
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 from typing import Any
-
-from fastapi_server.db import now_ms
-
-
-@dataclass(frozen=True)
-class ResolvedURL:
-    uri: str
-    expires_at: int
-
-
-class StorageResolver:
-    def resolve(self, logical_uri: str, ttl_s: int) -> ResolvedURL:
-        return ResolvedURL(uri=logical_uri, expires_at=now_ms() + (ttl_s * 1000))
 
 
 @dataclass(frozen=True)
@@ -49,14 +37,12 @@ class ExportStorage:
         return ("\n".join(lines) + ("\n" if lines else "")).encode("utf-8")
 
     def _csv_bytes(self, rows: list[dict[str, Any]], include_fields: list[str]) -> bytes:
-        from io import StringIO
-
-        buffer = StringIO()
-        writer = csv.DictWriter(buffer, fieldnames=include_fields)
+        buf = StringIO()
+        writer = csv.DictWriter(buf, fieldnames=include_fields)
         writer.writeheader()
         for row in rows:
             writer.writerow({k: row.get(k) for k in include_fields})
-        return buffer.getvalue().encode("utf-8")
+        return buf.getvalue().encode("utf-8")
 
     def write_bundle(
         self,
@@ -73,7 +59,6 @@ class ExportStorage:
         dataset_path = self.base_dir / dataset_name
         if dataset_path.exists():
             dataset_path.unlink()
-
         ext = dataset_name.rsplit(".", 1)[-1]
         if ext == "jsonl":
             dataset_bytes = self._jsonl_bytes(rows)
@@ -114,6 +99,6 @@ class ExportStorage:
 
     def audit(self, action: str, payload: dict[str, Any]) -> None:
         self.audit_log_path.parent.mkdir(parents=True, exist_ok=True)
-        entry = {"ts": now_ms(), "action": action, "payload": payload}
+        entry = {"action": action, "payload": payload}
         with self.audit_log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry, separators=(",", ":"), sort_keys=True) + "\n")

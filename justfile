@@ -6,11 +6,11 @@ client_port := env_var_or_default('CLIENT_PORT', '8080')
 uv_cache_dir := env_var_or_default('UV_CACHE_DIR', '.uv-cache')
 
 bootstrap:
-    if command -v uv >/dev/null 2>&1; then
-      UV_CACHE_DIR={{uv_cache_dir}} uv sync --dev
-    else
-      python3 -m venv .venv
-      .venv/bin/pip install -e ".[dev]"
+    if command -v uv >/dev/null 2>&1; then \
+      UV_CACHE_DIR={{uv_cache_dir}} uv sync --dev; \
+    else \
+      python3 -m venv .venv; \
+      .venv/bin/pip install -e ".[dev]"; \
     fi
     mkdir -p data
     just db-upgrade
@@ -36,13 +36,20 @@ test-client:
     @echo "[test-client] If skipped, pytest will print the skip reason below."
     UV_CACHE_DIR={{uv_cache_dir}} uv run python -m pytest -q -rs fastapi_server/tests/test_client_browser.py
 
+test-perf:
+    @echo "[test-perf] Performance gates"
+    UV_CACHE_DIR={{uv_cache_dir}} uv run python -m pytest -q fastapi_server/tests/test_performance_gates.py
+    @echo "[test-perf] Browser local-latency gate (Playwright)"
+    @echo "[test-perf] If skipped, pytest will print the skip reason below."
+    UV_CACHE_DIR={{uv_cache_dir}} uv run python -m pytest -q -rs fastapi_server/tests/test_client_browser.py -k local_decision_latency_gate
+
 lint:
     UV_CACHE_DIR={{uv_cache_dir}} uv run python -m ruff check .
 
 fmt:
     UV_CACHE_DIR={{uv_cache_dir}} uv run python -m ruff format .
 
-check: fmt lint test
+check: fmt lint test test-perf
 
 db-migrate name:
     UV_CACHE_DIR={{uv_cache_dir}} uv run alembic -c alembic.ini revision --autogenerate -m "{{name}}"

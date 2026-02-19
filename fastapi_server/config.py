@@ -13,6 +13,7 @@ class Settings:
     signed_url_ttl_s: int = int(os.getenv("TRIAGEDECK_SIGNED_URL_TTL_S", 15 * 60))
     export_ttl_ms: int = int(os.getenv("TRIAGEDECK_EXPORT_TTL_MS", 7 * 24 * 60 * 60 * 1000))
     export_max_rows: int = int(os.getenv("TRIAGEDECK_EXPORT_MAX_ROWS", 1_000_000))
+    export_max_bytes: int = int(os.getenv("TRIAGEDECK_EXPORT_MAX_BYTES", 5 * 1024 * 1024 * 1024))
     export_max_concurrent_per_user: int = int(
         os.getenv("TRIAGEDECK_EXPORT_MAX_CONCURRENT_PER_USER", 2)
     )

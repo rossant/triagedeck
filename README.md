@@ -79,3 +79,50 @@ Playwright setup (for `just test-client`):
 
 - `uv add --dev playwright`
 - `uv run playwright install chromium`
+
+## Manual Testing (local)
+
+1. Bootstrap and run
+
+- `just bootstrap`
+- `just dev`
+- Open `http://127.0.0.1:8080`
+
+2. UI smoke test
+
+- Use `reviewer@example.com`, click `Load`.
+- Press `P` / `F` to create decisions.
+- Navigate with `Left` / `Right`.
+- Click `Export Local State`, then re-import with `Import Local State`.
+- Click `Crash Replay Test` and confirm success in the log.
+
+3. Offline replay test (browser)
+
+- In DevTools, set Network to `Offline`.
+- Press `P`: expect `SYNC_ERROR` and queued count increase.
+- Return online, press `R`: expect `SYNC_OK` and queue returns to `0`.
+
+4. API smoke test (terminal)
+
+```bash
+PROJECT_ID=$(curl -s -H 'x-user-id: reviewer@example.com' http://127.0.0.1:8000/api/v1/projects | jq -r '.projects[0].project_id')
+ITEM_ID=$(curl -s -H 'x-user-id: reviewer@example.com' "http://127.0.0.1:8000/api/v1/projects/$PROJECT_ID/items?limit=1" | jq -r '.items[0].item_id')
+
+curl -s -H 'x-user-id: reviewer@example.com' -H 'content-type: application/json' \
+  -d "{\"client_id\":\"$(uuidgen)\",\"session_id\":\"$(uuidgen)\",\"events\":[{\"event_id\":\"$(uuidgen)\",\"item_id\":\"$ITEM_ID\",\"decision_id\":\"pass\",\"note\":\"manual\",\"ts_client\":$(date +%s%3N)}]}" \
+  "http://127.0.0.1:8000/api/v1/projects/$PROJECT_ID/events" | jq
+```
+
+5. Export API smoke test (terminal)
+
+```bash
+EXPORT_ID=$(curl -s -H 'x-user-id: reviewer@example.com' -H 'content-type: application/json' \
+  -d '{"mode":"labels_only","label_policy":"latest_per_user","format":"jsonl","filters":{},"include_fields":["item_id","external_id","decision_id","note","ts_server"]}' \
+  "http://127.0.0.1:8000/api/v1/projects/$PROJECT_ID/exports" | jq -r '.export_id')
+
+curl -s -H 'x-user-id: reviewer@example.com' "http://127.0.0.1:8000/api/v1/projects/$PROJECT_ID/exports/$EXPORT_ID" | jq
+```
+
+6. Metrics check
+
+- `curl -s http://127.0.0.1:8000/metrics | jq`

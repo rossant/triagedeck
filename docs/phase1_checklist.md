@@ -4,23 +4,20 @@ Source of truth: `docs/spec.md` v1.3 and `docs/api.md`.
 
 ## Immediate Next Steps (Implementation Order)
 
-1. Close API spec-parity gaps across FastAPI and Django adapter:
-   - strict cursor expiry behavior
-   - export limits/concurrency rules
-   - deterministic ordering edge cases
-   - consistent error code semantics
-2. Harden export pipeline from baseline to production-ready behavior:
-   - deterministic dataset artifact generation
-   - manifest hash/row reproducibility guarantees
-   - storage abstraction + expiry cleanup and audit hooks
-3. Expand client resilience coverage:
-   - offline queue accumulation/replay tests
-   - reconnect idempotency checks
-   - URL state round-trip recovery validation
-4. Add Phase 1 performance gate automation:
-   - p95 local decision latency
-   - p95 sync ack latency
-   - regression guardrails in CI/local checks
+Completed in codebase:
+- API parity hardening across FastAPI + Django adapter (cursor validation, export limits, listing visibility parity, error semantics).
+- Export pipeline hardening baseline (deterministic artifacts/manifests, storage abstraction, expiry cleanup hooks, audit hooks).
+- Client resilience test expansion (offline queue replay + URL round-trip browser tests).
+- Performance gate automation (local decision latency and sync ack p95 tests + `just test-perf`).
+- Structured observability baseline (metrics endpoint + ingest/export counters/latencies + structured logs).
+
+Now prioritize:
+1. Contract depth expansion:
+   - additional edge-case contract tests for cursor tampering, export lifecycle transitions, and deterministic replay convergence
+2. CI-equivalent local gate tightening:
+   - ensure `just check` is the single strict pre-merge gate and document skip policies for environment-constrained tests
+3. Observability depth expansion:
+   - add richer dimensions (error codes, role, endpoint class) and dashboard-ready export
 
 ## 1. Backend Data Model
 

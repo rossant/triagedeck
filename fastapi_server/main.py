@@ -1,14 +1,12 @@
 from __future__ import annotations
 
-import csv
-import hashlib
-import json
+import time
 import uuid
-from datetime import UTC, datetime
-from pathlib import Path
 
 from fastapi import Depends, FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.requests import Request
+from fastapi.responses import Response
 from sqlalchemy import and_, func, or_, select
 
 from fastapi_server.auth import User, get_user, project_role_or_404
@@ -33,11 +31,23 @@ from fastapi_server.errors import (
     not_found,
     validation_error,
 )
+from fastapi_server.observability import increment, log_event, observe_ms, snapshot
 from fastapi_server.schemas import EventsIngestRequest, ExportCreateRequest
-from fastapi_server.storage import StorageResolver
+from fastapi_server.storage import ExportStorage, StorageResolver
 
 app = FastAPI(title="triagedeck")
 resolver = StorageResolver()
+export_store = ExportStorage()
+DEFAULT_EXPORT_ALLOWLIST = {
+    "item_id",
+    "external_id",
+    "decision_id",
+    "note",
+    "ts_server",
+    "variant_key",
+    "metadata.subject_id",
+    "metadata.session_id",
+}
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:8080", "http://localhost:8080"],
@@ -45,6 +55,39 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def request_observability(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    t0 = time.perf_counter()
+    response = None
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        duration_ms = (time.perf_counter() - t0) * 1000.0
+        increment("http.requests.total")
+        observe_ms("http.request.latency_ms", duration_ms)
+        log_event(
+            "http.request",
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            status=status_code,
+            duration_ms=round(duration_ms, 2),
+            user_id=request.headers.get("x-user-id"),
+        )
+        if response is None:
+            response = Response(status_code=status_code)
+        response.headers["x-request-id"] = request_id
+
+
+@app.get("/metrics")
+def metrics():
+    return snapshot()
 
 
 @app.get("/health")
@@ -92,16 +135,34 @@ def get_project_config(project_id: str, user: User = Depends(get_user)):
         }
 
 
-def _check_cursor(cursor: str | None):
+def _check_cursor(cursor: str | None, required_keys: tuple[str, ...]):
     if not cursor:
         return None
     try:
         data = decode_cursor(cursor)
     except Exception as exc:
         raise bad_request("invalid_cursor", "Cursor is invalid or expired") from exc
-    if data.get("exp", 0) < now_ms():
+    exp = data.get("exp")
+    payload = data.get("payload")
+    if not isinstance(exp, int):
         raise bad_request("invalid_cursor", "Cursor is invalid or expired")
-    return data["payload"]
+    if exp < now_ms():
+        raise bad_request("invalid_cursor", "Cursor is invalid or expired")
+    if not isinstance(payload, dict):
+        raise bad_request("invalid_cursor", "Cursor is invalid or expired")
+    if any(k not in payload for k in required_keys):
+        raise bad_request("invalid_cursor", "Cursor is invalid or expired")
+    return payload
+
+
+def _parse_limit(value: str | None, default: int, min_value: int, max_value: int) -> int:
+    if value is None:
+        return default
+    try:
+        raw = int(value)
+    except ValueError as exc:
+        raise bad_request("bad_request", "Invalid limit") from exc
+    return min(max(raw, min_value), max_value)
 
 
 def _item_variants(session, item_ids: list[str]) -> dict[str, list[dict]]:
@@ -134,10 +195,11 @@ def _item_variants(session, item_ids: list[str]) -> dict[str, list[dict]]:
 def list_items(
     project_id: str,
     cursor: str | None = Query(default=None),
-    limit: int = Query(default=100, ge=1, le=200),
+    limit: str | None = Query(default=None),
     user: User = Depends(get_user),
 ):
-    payload = _check_cursor(cursor)
+    payload = _check_cursor(cursor, ("sort_key", "item_id"))
+    page_limit = _parse_limit(limit, default=100, min_value=1, max_value=200)
     with session_scope() as session:
         project_role_or_404(session, project_id, user.user_id)
         q = select(item).where(
@@ -152,7 +214,7 @@ def list_items(
                 )
             )
         rows = (
-            session.execute(q.order_by(item.c.sort_key.asc(), item.c.id.asc()).limit(limit))
+            session.execute(q.order_by(item.c.sort_key.asc(), item.c.id.asc()).limit(page_limit))
             .mappings()
             .all()
         )
@@ -247,6 +309,7 @@ def _rank_key(e: dict) -> tuple[int, int, str]:
 
 @app.post(f"{settings.api_prefix}/projects/{{project_id}}/events")
 def ingest_events(project_id: str, payload: EventsIngestRequest, user: User = Depends(get_user)):
+    t0 = time.perf_counter()
     if len(payload.events) > 200:
         raise validation_error("too_many_events", "Maximum 200 events per request")
 
@@ -385,6 +448,19 @@ def ingest_events(project_id: str, payload: EventsIngestRequest, user: User = De
             results.append({"event_id": ev.event_id, "status": "accepted"})
 
         session.commit()
+        increment("events.ingest.calls")
+        increment("events.ingest.accepted", accepted)
+        increment("events.ingest.duplicate", duplicate)
+        increment("events.ingest.rejected", rejected)
+        observe_ms("events.ingest.latency_ms", (time.perf_counter() - t0) * 1000.0)
+        log_event(
+            "events.ingest",
+            project_id=project_id,
+            user_id=user.user_id,
+            accepted=accepted,
+            duplicate=duplicate,
+            rejected=rejected,
+        )
         return {
             "acked": accepted + duplicate,
             "accepted": accepted,
@@ -399,10 +475,11 @@ def ingest_events(project_id: str, payload: EventsIngestRequest, user: User = De
 def list_decisions(
     project_id: str,
     cursor: str | None = Query(default=None),
-    limit: int = Query(default=500, ge=1, le=2000),
+    limit: str | None = Query(default=None),
     user: User = Depends(get_user),
 ):
-    payload = _check_cursor(cursor)
+    payload = _check_cursor(cursor, ("ts_server", "item_id"))
+    page_limit = _parse_limit(limit, default=500, min_value=1, max_value=2000)
     with session_scope() as session:
         project_role_or_404(session, project_id, user.user_id)
         q = select(decision_latest).where(
@@ -423,7 +500,7 @@ def list_decisions(
             session.execute(
                 q.order_by(
                     decision_latest.c.ts_server.asc(), decision_latest.c.item_id.asc()
-                ).limit(limit)
+                ).limit(page_limit)
             )
             .mappings()
             .all()
@@ -453,9 +530,58 @@ def _require_export_create_role(role: str):
         raise forbidden()
 
 
+def _cleanup_expired_exports(session) -> None:
+    expired_rows = (
+        session.execute(
+            select(export_job.c.id, export_job.c.file_uri).where(
+                export_job.c.status != "expired",
+                export_job.c.expires_at.is_not(None),
+                export_job.c.expires_at < now_ms(),
+            )
+        )
+        .mappings()
+        .all()
+    )
+    for row in expired_rows:
+        if row["file_uri"]:
+            export_store.remove_artifacts_for_uri(row["file_uri"])
+        session.execute(
+            export_job.update()
+            .where(export_job.c.id == row["id"])
+            .values(status="expired", completed_at=now_ms())
+        )
+        export_store.audit("export_expired_cleanup", {"export_id": row["id"]})
+
+
+def _normalize_include_fields(fields: list[str]) -> list[str]:
+    default = ["item_id", "external_id", "decision_id", "note", "ts_server"]
+    return fields if fields else default
+
+
+def _extract_export_value(field: str, row: dict) -> object:
+    if field == "item_id":
+        return row["item_id"]
+    if field == "external_id":
+        return row["external_id"]
+    if field == "decision_id":
+        return row["decision_id"]
+    if field == "note":
+        return row["note"]
+    if field == "ts_server":
+        return row["ts_server"]
+    if field == "variant_key":
+        return None
+    if field.startswith("metadata."):
+        key = field.split(".", 1)[1]
+        return (row.get("metadata_json") or {}).get(key)
+    return None
+
+
 @app.post(f"{settings.api_prefix}/projects/{{project_id}}/exports")
 def create_export(project_id: str, body: ExportCreateRequest, user: User = Depends(get_user)):
+    t0 = time.perf_counter()
     with session_scope() as session:
+        _cleanup_expired_exports(session)
         role = project_role_or_404(session, project_id, user.user_id)
         _require_export_create_role(role)
 
@@ -477,7 +603,10 @@ def create_export(project_id: str, body: ExportCreateRequest, user: User = Depen
         if not prow:
             raise not_found()
         allowlist = set(prow.config_json.get("export_allowlist", []))
-        for field in body.include_fields:
+        if not allowlist:
+            allowlist = DEFAULT_EXPORT_ALLOWLIST
+        include_fields = _normalize_include_fields(body.include_fields)
+        for field in include_fields:
             if field not in allowlist:
                 raise validation_error("field_not_allowlisted", f"Field not allowlisted: {field}")
 
@@ -494,7 +623,7 @@ def create_export(project_id: str, body: ExportCreateRequest, user: User = Depen
                 label_policy=body.label_policy,
                 format=body.format,
                 filters_json=body.filters,
-                include_fields_json=body.include_fields,
+                include_fields_json=include_fields,
                 created_at=created_at,
             )
         )
@@ -520,58 +649,31 @@ def create_export(project_id: str, body: ExportCreateRequest, user: User = Depen
         if len(rows) > settings.export_max_rows:
             raise validation_error("export_limit_exceeded", "Export exceeds max rows")
 
-        out_dir = Path("data/exports")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-        ext = "jsonl" if body.format not in {"csv", "parquet"} else body.format
-        dataset_name = f"triagedeck_export_{project_id}_{stamp}.{ext}"
-        dataset_path = out_dir / dataset_name
-
-        if ext == "jsonl":
-            with dataset_path.open("w", encoding="utf-8") as f:
-                for r in rows:
-                    obj = {
-                        "item_id": r["item_id"],
-                        "external_id": r["external_id"],
-                        "decision_id": r["decision_id"],
-                        "note": r["note"],
-                        "ts_server": r["ts_server"],
-                    }
-                    f.write(json.dumps(obj, separators=(",", ":")) + "\n")
-        elif ext == "csv":
-            with dataset_path.open("w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(
-                    f,
-                    fieldnames=["item_id", "external_id", "decision_id", "note", "ts_server"],
-                )
-                writer.writeheader()
-                for r in rows:
-                    writer.writerow(
-                        {
-                            "item_id": r["item_id"],
-                            "external_id": r["external_id"],
-                            "decision_id": r["decision_id"],
-                            "note": r["note"],
-                            "ts_server": r["ts_server"],
-                        }
-                    )
-        else:
-            dataset_path.write_text(
-                "parquet output not implemented in local mode\n", encoding="utf-8"
-            )
-
-        digest = hashlib.sha256(dataset_path.read_bytes()).hexdigest()
+        export_rows = [
+            {field: _extract_export_value(field, r) for field in include_fields} for r in rows
+        ]
         manifest = {
             "snapshot_at": created_at,
             "project_id": project_id,
             "decision_schema_version": prow.decision_schema_json.get("version", 1),
             "label_policy": body.label_policy,
             "filters": body.filters,
-            "row_count": len(rows),
-            "sha256": digest,
+            "include_fields": include_fields,
+            "row_count": len(export_rows),
+            "sha256": "",
         }
-        manifest_path = out_dir / f"{dataset_path.stem}_manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        artifact = export_store.write_bundle(
+            project_id=project_id,
+            snapshot_at=created_at,
+            fmt=body.format,
+            include_fields=include_fields,
+            rows=export_rows,
+            manifest=manifest,
+        )
+        if artifact.size_bytes > settings.export_max_bytes:
+            export_store.remove_artifacts_for_uri(artifact.file_uri)
+            raise validation_error("export_limit_exceeded", "Export exceeds max file size")
+        manifest["sha256"] = artifact.sha256
 
         expires_at = created_at + settings.export_ttl_ms
         session.execute(
@@ -580,10 +682,29 @@ def create_export(project_id: str, body: ExportCreateRequest, user: User = Depen
             .values(
                 status="ready",
                 manifest_json=manifest,
-                file_uri=str(dataset_path),
+                file_uri=artifact.file_uri,
                 expires_at=expires_at,
                 completed_at=now_ms(),
             )
+        )
+        export_store.audit(
+            "export_ready",
+            {
+                "export_id": export_id,
+                "project_id": project_id,
+                "row_count": artifact.row_count,
+                "sha256": artifact.sha256,
+            },
+        )
+        increment("exports.create.calls")
+        increment("exports.create.ready", 1)
+        observe_ms("exports.create.latency_ms", (time.perf_counter() - t0) * 1000.0)
+        log_event(
+            "exports.create",
+            project_id=project_id,
+            user_id=user.user_id,
+            export_id=export_id,
+            row_count=artifact.row_count,
         )
         session.commit()
         return {"export_id": export_id, "status": "queued"}
@@ -593,13 +714,17 @@ def create_export(project_id: str, body: ExportCreateRequest, user: User = Depen
 def list_exports(
     project_id: str,
     cursor: str | None = Query(default=None),
-    limit: int = Query(default=50, ge=1, le=100),
+    limit: str | None = Query(default=None),
     user: User = Depends(get_user),
 ):
-    payload = _check_cursor(cursor)
+    t0 = time.perf_counter()
+    payload = _check_cursor(cursor, ("created_at", "id"))
+    page_limit = _parse_limit(limit, default=50, min_value=1, max_value=100)
     with session_scope() as session:
-        project_role_or_404(session, project_id, user.user_id)
+        role = project_role_or_404(session, project_id, user.user_id)
         q = select(export_job).where(export_job.c.project_id == project_id)
+        if role != "admin":
+            q = q.where(export_job.c.requested_by_user_id == user.user_id)
         if payload:
             q = q.where(
                 or_(
@@ -612,7 +737,7 @@ def list_exports(
             )
         rows = (
             session.execute(
-                q.order_by(export_job.c.created_at.desc(), export_job.c.id.desc()).limit(limit)
+                q.order_by(export_job.c.created_at.desc(), export_job.c.id.desc()).limit(page_limit)
             )
             .mappings()
             .all()
@@ -633,11 +758,14 @@ def list_exports(
             next_cursor = encode_cursor(
                 {"created_at": last["created_at"], "id": last["id"]}, settings.cursor_ttl_ms
             )
+        increment("exports.list.calls")
+        observe_ms("exports.list.latency_ms", (time.perf_counter() - t0) * 1000.0)
         return {"exports": out, "next_cursor": next_cursor}
 
 
 @app.get(f"{settings.api_prefix}/projects/{{project_id}}/exports/{{export_id}}")
 def get_export(project_id: str, export_id: str, user: User = Depends(get_user)):
+    t0 = time.perf_counter()
     with session_scope() as session:
         role = project_role_or_404(session, project_id, user.user_id)
         row = (
@@ -655,6 +783,8 @@ def get_export(project_id: str, export_id: str, user: User = Depends(get_user)):
             raise forbidden()
         if row["expires_at"] and row["expires_at"] < now_ms():
             raise gone("export_expired", "Export has expired")
+        increment("exports.get.calls")
+        observe_ms("exports.get.latency_ms", (time.perf_counter() - t0) * 1000.0)
         return {
             "export_id": row["id"],
             "status": row["status"],
@@ -668,6 +798,7 @@ def get_export(project_id: str, export_id: str, user: User = Depends(get_user)):
 
 @app.delete(f"{settings.api_prefix}/projects/{{project_id}}/exports/{{export_id}}")
 def cancel_export(project_id: str, export_id: str, user: User = Depends(get_user)):
+    t0 = time.perf_counter()
     with session_scope() as session:
         role = project_role_or_404(session, project_id, user.user_id)
         row = (
@@ -689,10 +820,15 @@ def cancel_export(project_id: str, export_id: str, user: User = Depends(get_user
         if row["status"] in {"failed", "expired"}:
             return {"status": row["status"]}
 
+        if row["file_uri"]:
+            export_store.remove_artifacts_for_uri(row["file_uri"])
         session.execute(
             export_job.update()
             .where(export_job.c.id == export_id)
             .values(status="failed", error_code="export_cancelled", completed_at=now_ms())
         )
+        export_store.audit("export_cancelled", {"export_id": export_id, "project_id": project_id})
+        increment("exports.cancel.calls")
+        observe_ms("exports.cancel.latency_ms", (time.perf_counter() - t0) * 1000.0)
         session.commit()
         return {"status": "failed", "error": {"code": "export_cancelled"}}

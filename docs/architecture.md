@@ -27,12 +27,16 @@ This implementation is a runnable baseline for Phase 1, not full feature-complet
 
 ## Next Steps
 
-1. API parity hardening:
-   - align remaining FastAPI + Django adapter behavior with `docs/spec.md`
-   - enforce export limit/concurrency and cursor-expiry edge cases uniformly
-2. Export pipeline hardening:
-   - move from baseline export behavior to reproducible artifact pipeline with stronger lifecycle controls
-3. Client resilience verification:
-   - add deeper browser/offline replay test coverage and URL-state recovery checks
-4. Performance gate enforcement:
-   - codify and run p95 latency gates required by Phase 1 exit criteria
+Completed:
+1. API parity hardening across FastAPI and Django adapter for cursor validation, export constraints, and role-scoped export visibility.
+2. Export pipeline hardening baseline with deterministic artifact generation, reproducible manifests, expiry cleanup, and audit hooks.
+3. Client resilience verification coverage for offline queue replay and URL state round-trip recovery.
+4. Performance gate enforcement via automated latency tests and `just test-perf`.
+5. Structured observability baseline:
+   - FastAPI and Django metrics snapshots exposed at `/metrics`
+   - Structured logging and in-memory latency/counter instrumentation for ingest/export flows
+
+Next:
+1. Expand contract tests for lifecycle edge cases and replay determinism.
+2. Tighten local/CI gate documentation and policies around environment-dependent skips.
+3. Extend observability depth with additional per-route/per-error dimensions and dashboards.
